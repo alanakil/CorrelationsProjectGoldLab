@@ -1,0 +1,802 @@
+%% Simulation of Sid's experiment.
+%%% Written by Alan Akil on Nov 24, 2020.
+%%% This is the simulation of a non-plastic balanced spiking network that
+%%% represents a local network of neurons in ACC. Activity of LC neurons is
+%%% known to be correlated with releases of Neropinephrine (NE) in the
+%%% cortex. Here we simulate trials of spontaneous activity in ACC (no LC
+%%% spiking), and trials where LC neurons spike (release of NE in ACC). We
+%%% model the release of NE in ACC as a rescaling of a subset of synapses  
+%%% by some factor. 
+%%% We can consider other ways of modeling the effect of NE release in
+%%% ACC. 
+
+% Set the seed for the simulation. Note that there is randomness in the
+% connectivity and in the input Poisson spiking. The scaling factor is the
+% number by which every synaptic weight is multiplied by when NE is released.
+seed=1; scaling_factor_ee=1.;
+scaling_factor_ei=1.5; scaling_factor_ie=1.; scaling_factor_ii=1.;
+
+% To run the code in compute servers it may be more convinient to run the 
+% script as a function, but it's not absolutely necessary.
+
+% function[] = myscript(seed,scaling_factor)
+
+%% Define variables that repeat over trials.
+
+start_time = tic;
+
+% Set the seed chosen above to the random number generator.
+rng(seed);
+
+% Number of neurons in each population
+N = 5000;
+Ne = 0.8*N; % E neurons
+Ni = 0.2*N; % I neurons
+
+% Number of neurons in ffwd layer
+Nx=0.2*N;
+
+% Recurrent net connection probabilities
+P=[0.1 0.1; 0.1 0.1];
+
+% Ffwd connection probs
+Px=[.1; .1];
+
+% Timescale of correlation
+taujitter=5;
+
+% Mean connection strengths between each cell type pair
+Jm=[25 -150; 112.5 -250]/sqrt(N); % Initial conn matrix at spontaneous activty
+Jxm=[180; 135]/sqrt(N);
+
+% Conn matrix when NE is released. The scaling factor can scale any
+% synapses EE, EI, IE, II. Presumably different effects on correlations
+% will be seen when you scale different types of synapses.
+Jm_lc=[scaling_factor_ee*25 -scaling_factor_ei*150;...
+    scaling_factor_ie*112.5 -scaling_factor_ii*250]/sqrt(N); 
+
+% Time discretization
+dt=.1;
+
+% Proportions of neurons in each population E, I, X
+qe=Ne/N;
+qi=Ni/N;
+qf=Nx/N;
+
+% Build mean field matrices. No need to worry about this so far. This is in
+% case we want to look at some theory.
+Q=[qe qi; qe qi];
+Qf=[qf; qf];
+W=P.*(Jm*sqrt(N)).*Q;
+Wx=Px.*(Jxm*sqrt(N)).*Qf;
+
+% Synaptic timescales of E, I, X
+taux=10;
+taue=8;
+taui=4;
+
+% Generate full connectivity matrices
+tic
+J_NeNe = binornd(1,P(1,1),Ne,Ne);
+J_NeNi = binornd(1,P(1,1),Ne,Ni);
+J_NiNe = binornd(1,P(1,1),Ni,Ne);
+J_NiNi = binornd(1,P(1,1),Ni,Ni);
+J=[Jm(1,1)*J_NeNe Jm(1,2)*J_NeNi; ...
+   Jm(2,1)*J_NiNe Jm(2,2)*J_NiNi];
+Jx=[Jxm(1)*binornd(1,Px(1),Ne,Nx); Jxm(2)*binornd(1,Px(2),Ni,Nx)];
+tGen=toc;
+disp(sprintf('\nTime to generate connections: %.2f sec',tGen))
+
+% Neuron parameters of EIF model
+Cm=1;
+gL=1/15;
+EL=-72;
+Vth=-50;
+Vre=-75;
+DeltaT=1;
+VT=-55;
+
+% This may be important if at some point we want to record currents or
+% voltages.
+% Indices of neurons to record currents, voltages
+nrecord0=10; % Number to record from each population
+Irecord=[randperm(Ne,nrecord0) randperm(Ni,nrecord0)+Ne];
+numrecord=numel(Irecord); % total number to record
+
+% Integer division function
+IntDivide=@(n,k)(floor((n-1)/k)+1);
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% %%%%%%%%%%% Start of the experiment %%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Trial Configuration.
+Total_number_trials = 100; % Total number of trials. 
+% Half of this is control (no LC spike), half LC spike (NE release).
+
+LCzero_Trials = sort(randsample(Total_number_trials, Total_number_trials/2, false)) ; % Let the order of
+% control and stim trials be random.
+LCspike_Trials = setdiff([1:Total_number_trials],LCzero_Trials);
+
+% Time (in ms) for sim
+TrialTime = 1000; % Time length of a trial in ms.
+T=TrialTime*Total_number_trials; % Total time of simulation in ms.
+
+% Find the start time of each trial to facilitate computation.
+LC_zero_start_times = ( LCzero_Trials - 1 ) * TrialTime;
+LC_spike_start_times = ( LCspike_Trials - 1 ) * TrialTime;
+
+
+% Number of time bins to average over when recording currents, voltage, etc
+nBinsRecord=10;
+dtRecord=nBinsRecord*dt;
+timeRecord=dtRecord:dtRecord:T;
+Ntrec=numel(timeRecord);
+
+% Number of time bins
+Nt=round(T/dt);
+time=dt:dt:T; % Time discretization
+
+
+% Maximum number of spikes for all neurons
+% in simulation. Make it 50Hz across all neurons
+% If there are more spikes, the simulation will
+% terminate
+maxns=ceil(.05*N*T);
+
+% This defines extra injeted current to cells if needed. It is set to zero.
+jistim=0;
+stimProb = 0.;
+StimulatedNeurons = [ones(Ne*stimProb,1); zeros(Ne*(1-stimProb),1)];  % binornd(1,stimProb, Ne,1);
+jestim=0.;
+
+% Extra stimulus: Istim is a time-dependent stimulus
+% it is delivered to all neurons with weights given by JIstim.
+% Specifically, the stimulus to neuron j at time index i is:
+% Istim(i)*JIstim(j)
+Istim=zeros(size(time));
+
+% Stimulate a subpopulation of E neurons only. Note this is off, since
+% jestim,jistim=0
+Jstim=sqrt(N)*[jestim*StimulatedNeurons ; jistim*ones(Ni,1)]; % Stimulate only E neurons
+
+
+%%% Make correlated Poisson spike times for ffwd layer
+%%% See Trousdale et al 2013 Front. in Comp Neur. for details on this
+%%% algorithm
+tic
+% Correlation between the spike trains in the ffwd layer
+% FFwd spike train rate (in kHz)
+rx=10/1000; % kHz
+c=0.2; % Max correlation coefficient
+p_daughter_processes = c * rand(Nx,1); % samples in U[0,c]
+% p_daughter_processes = c * rand(Nx,1); % samples in [0,c]
+
+% Timescale of correlation
+taujitter=5; % We jitter all spikes to avoid perfect synchrony by adding a RV with mean taujitter.
+
+if(c<1e-5) % If uncorrelated
+    nspikeX=poissrnd(Nx*rx*T);
+    st=rand(nspikeX,1)*T;
+    sx=zeros(2,numel(st));
+    sx(1,:)=sort(st);
+    sx(2,:)=randi(Nx,1,numel(st)); % neuron indices
+    clear st;
+else % If correlated
+    rm=rx/mean(p_daughter_processes); % Firing rate of mother process
+    nstm=poissrnd(rm*T); % Number of mother spikes
+    stm=rand(nstm,1)*T; % spike times of mother process    
+    maxnsx=T*rx*Nx*1.2; % Max num spikes
+    sx=zeros(2,maxnsx);
+    ns=0;
+    for j=1:Nx  % For each ffwd spike train
+        ns0=binornd(nstm,p_daughter_processes(j)); % Number of spikes for this spike train
+        st=randsample(stm,ns0); % Sample spike times randomly
+        st=st+taujitter*randn(size(st)); % jitter spike times
+        st=st(st>0 & st<T); % Get rid of out-of-bounds times
+        ns0=numel(st); % Re-compute spike count
+        sx(1,ns+1:ns+ns0)=st; % Set the spike times and indices        
+        sx(2,ns+1:ns+ns0)=j;
+        ns=ns+ns0;
+    end
+
+    % Get rid of padded zeros
+    sx = sx(:,sx(1,:)>0);
+    
+    % Sort by spike time
+    [~,I] = sort(sx(1,:));
+    sx = sx(:,I);
+    nspikeX=size(sx,2);
+end
+tGenx=toc;
+disp(sprintf('\nTime to generate ffwd spikes: %.2f sec',tGenx))
+
+
+% Random initial voltages
+V0=rand(N,1)*(VT-Vre)+Vre;
+
+% Set voltage to initial value V0.
+V=V0;
+% Define array of currents coming out of each neuron.
+Ie=zeros(N,1);
+Ii=zeros(N,1);
+Ix=zeros(N,1);
+% Preallocate memory to store currents if necessary.
+IeRec=zeros(1,Ntrec);
+IiRec=zeros(1,Ntrec);
+IxRec=zeros(1,Ntrec);
+% VRec=zeros(numrecord,Ntrec);
+% wRec=zeros(numrecord,Ntrec);
+
+iFspike=1; 
+nspike=0;
+TooManySpikes=0;
+tic
+for i=1:numel(time)
+    
+    % Propogate ffwd spikes from X
+    while(sx(1,iFspike)<=time(i) && iFspike<nspikeX)
+        jpre=sx(2,iFspike);
+        Ix=Ix+Jx(:,jpre)/taux;
+        iFspike=iFspike+1;
+    end
+    
+    
+    % Check if we are in a control trial or if NE is released (scale J).
+    if(ismember(i*dt,LC_zero_start_times))
+        % If zero LC spikes -> no NE release -> No scaling of synapses.
+        J=[Jm(1,1)*J_NeNe Jm(1,2)*J_NeNi; ...
+            Jm(2,1)*J_NiNe Jm(2,2)*J_NiNi];
+    elseif(ismember(i*dt,LC_spike_start_times))
+        % If there are LC spikes -> NE release -> Scale synapses.
+        J=[Jm_lc(1,1)*J_NeNe Jm_lc(1,2)*J_NeNi; ...
+            Jm_lc(2,1)*J_NiNe Jm_lc(2,2)*J_NiNi];
+    end
+
+    % Euler update to V
+    V=V+(dt/Cm)*(Istim(i)*Jstim+Ie+Ii+Ix+gL*(EL-V)+gL*DeltaT*exp((V-VT)/DeltaT));
+    
+    % Find which neurons spiked
+    Ispike=find(V>=Vth);
+    
+    % If there are spikes
+    if(~isempty(Ispike))
+        
+        % Store spike times and neuron indices
+        if(nspike+numel(Ispike)<=maxns)
+            s(1,nspike+1:nspike+numel(Ispike))=time(i);
+            s(2,nspike+1:nspike+numel(Ispike))=Ispike;  
+        else
+            TooManySpikes=1;
+            break;
+        end
+        
+        % Update synaptic currents due to spikes
+        Ie=Ie+sum(J(:,Ispike(Ispike<=Ne)),2)/taue;
+        Ii=Ii+sum(J(:,Ispike(Ispike>Ne)),2)/taui;
+
+        % Update cumulative number of spikes
+        nspike=nspike+numel(Ispike);
+    end
+    
+    % Euler update to synaptic currents
+    Ie=Ie-dt*Ie/taue;
+    Ii=Ii-dt*Ii/taui;
+    Ix=Ix-dt*Ix/taux;
+  
+    % This makes plots of V(t) look better.
+    % All action potentials reach Vth exactly.
+    % This has no real effect on the network sims
+    V(Ispike)=Vth;
+    
+    % Store recorded variables
+    ii=IntDivide(i,nBinsRecord);
+    IeRec(1,ii)=IeRec(1,ii)+mean(Ie(Irecord));
+    IiRec(1,ii)=IiRec(1,ii)+mean(Ii(Irecord));
+    IxRec(1,ii)=IxRec(1,ii)+mean(Ix(Irecord));
+    %VRec(:,ii)=VRec(:,ii)+V(Irecord);
+    
+    % Reset mem pot.
+    V(Ispike)=Vre;
+    
+end
+IeCurrent=IeRec/nBinsRecord; % Normalize recorded variables by # bins
+IiCurrent=IiRec/nBinsRecord;
+IxCurrent=IxRec/nBinsRecord;
+%VRec=VRec/nBinsRecord;
+% JRec=JRec/nBinsRecord;
+
+s=s(:,1:nspike); % Get rid of padding in s
+tSim=toc;
+disp(sprintf('\nTime for simulation: %.2f min',tSim/60))
+
+
+% Mean rate of each neuron (excluding burn-in period)
+Tburn=0; % Sometimes we exclude a burn-in period, but it is not necessary here, so set to zero.
+dtRate=100; % Time window of counting spikes
+
+% Preallocate memory.
+reMean = zeros(1,Total_number_trials);
+riMean = zeros(1,Total_number_trials);
+
+% Next, calculate the rate of E and I for each single trial.
+parfor i = 1:Total_number_trials
+    reSim=hist( s( 2,s(1,:)>TrialTime*(i-1) & s(2,:)<=Ne ...
+        & s(1,:)< TrialTime*i ),1:Ne)/(TrialTime);
+    riSim=hist( s( 2,s(1,:)>Tburn+TrialTime*(i-1) & s(2,:)>Ne ...
+        & s(1,:)< TrialTime*i)-Ne,1:Ni)/(TrialTime-Tburn);
+    reMean(1, i)=mean(reSim); % Mean rate of E neurons at some Trial 'i' in a Block.
+    riMean(1, i)=mean(riSim); % Mean rate of I neurons at some Trial 'i' in a Block.
+end
+
+% Calculate the mean rates for LCzero and LCspike trials separately for
+% each block.
+reMeanControl = mean( reMean(1, LCzero_Trials) );
+riMeanControl = mean( riMean(1, LCzero_Trials) );
+reMeanEvoked = mean( reMean( 1, LCspike_Trials ) ); % setdiff is used to only look at Laser trials.
+riMeanEvoked = mean( riMean( 1, LCspike_Trials ) ); % setdiff is used to only look at Laser trials.
+
+% Mean rate over E and I pops for the whole block.
+reMeanBlock=mean(reMean(1,:));
+riMeanBlock=mean(riMean(1,:));
+disp(sprintf('\nMean E and I rates from sims: %.2fHz %.2fHz',1000*reMeanBlock,1000*riMeanBlock))
+disp(sprintf('\nLaser Mean E and I rates from sims: %.2fHz %.2fHz',1000*reMeanEvoked,1000*riMeanEvoked))
+disp(sprintf('\nControl Mean E and I rates from sims: %.2fHz %.2fHz',1000*reMeanControl,1000*riMeanControl))
+
+% Time-dependent mean rates of E and I populations
+eRateTime=hist(s(1,s(2,:)<=Ne),1:dtRate:T)/(dtRate*Ne);
+iRateTime=hist(s(1,s(2,:)>Ne),1:dtRate:T)/(dtRate*Ni);
+
+
+%% Compute the rates sliding a window over time and trials.
+winsize=500; % in ms. Size of counting window for rates and corrs.
+sliding_window = 500; % in ms. Size of slide of counting window.
+Number_of_points_rates = (TrialTime/winsize)*(winsize/sliding_window); % Number of
+% points in the time axis for which correlations are calculated.
+
+% The code is structured to be able to slide counting windows of
+% correlations over time and a subset of trials. This gives blocks of
+% trials and allows us to see dynamic changes in correlations. This is not
+% necessary for now, so we just have one Block of trials (NBlockTrials=1) 
+% containing all trials and we slide windows over time only. 
+block_slide_size = Total_number_trials / 2 - 1; % = how many trials in one block.
+NBlockTrials = length(LCspike_Trials)-block_slide_size; % = how many blocks of trials.
+
+% Preallocate memory for firing rates
+FR_E_control = zeros(NBlockTrials,Number_of_points_rates);
+FR_E_evoked = zeros(NBlockTrials,Number_of_points_rates);
+FR_I_control = zeros(NBlockTrials,Number_of_points_rates);
+FR_I_evoked = zeros(NBlockTrials,Number_of_points_rates);
+
+% spikeTimes = s(1, ismember(s(2,:),find(StimulatedNeurons==1)));
+
+% Use spike times to compute rates
+spikeTimes_E = s(1, s(2,:)<=Ne);
+spikeTimes_I = s(1, s(2,:)>Ne);
+
+
+% This part can be parallelized if we get rid of the blocks of trials and
+% permanently have just one big block. In any case, this loop should not
+% take very long.
+for BlockTrial=1:NBlockTrials
+    tic
+    % Save the trials used. All trials are used if we have just one block
+    % of trials.
+    ControlTrialsUsed = LCzero_Trials(BlockTrial:block_slide_size+BlockTrial-1);
+    LaserTrialsUsed = LCspike_Trials(BlockTrial:block_slide_size+BlockTrial-1);
+    % For every trial,
+    for i = 1:Total_number_trials
+        % Count spikes only if i is a control trial.
+        if(ismember(i,ControlTrialsUsed)) 
+            for window = 1:Number_of_points_rates
+                % Start counting at T1
+                T1=TrialTime*(i-1) + sliding_window*(window-1);
+                % Stop counting at T2
+                T2=T1+winsize;
+                % Note that T1, T2 partition a trial depending on how large
+                % the slide of the window is. Note T2-T1=winsize.
+                
+                FR_E_control(BlockTrial,window) = FR_E_control(BlockTrial,window) +...
+                    histcounts(spikeTimes_E(spikeTimes_E>T1 & spikeTimes_E< T2)...
+                    ,T1:winsize:T2)/(winsize*Ne);
+                FR_I_control(BlockTrial,window) = FR_I_control(BlockTrial,window) +...
+                    histcounts(spikeTimes_I(spikeTimes_I>T1 & spikeTimes_I< T2)...
+                    ,T1:winsize:T2)/(winsize*Ni);
+            end
+        % if laser trial.
+        elseif(ismember(i,LaserTrialsUsed))  
+            for window = 1:Number_of_points_rates
+                % Start counting at T1
+                T1=TrialTime*(i-1) + sliding_window*(window-1); 
+                % Stop counting at T2
+                T2=T1+winsize;   
+                
+                FR_E_evoked(BlockTrial,window) = FR_E_evoked(BlockTrial,window) +...
+                    histcounts(spikeTimes_E(spikeTimes_E>T1 & spikeTimes_E< T2)...
+                    ,T1:winsize:T2)/(winsize*Ne);
+                FR_I_evoked(BlockTrial,window) = FR_I_evoked(BlockTrial,window) +...
+                    histcounts(spikeTimes_I(spikeTimes_I>T1 & spikeTimes_I< T2)...
+                    ,T1:winsize:T2)/(winsize*Ni);
+            end
+        end
+    end
+    toc
+end
+% We summed spike counts over trials, now we divide by over how many trials
+% we added them.
+FR_E_control = FR_E_control / block_slide_size; 
+FR_E_evoked = FR_E_evoked / block_slide_size;
+FR_I_control = FR_I_control / block_slide_size; 
+FR_I_evoked = FR_I_evoked / block_slide_size;
+
+%% Compute the PSTHs sliding a window over time and trials.
+% The time window will be potentially different to the previous loop, so we
+% keep the two separated. In the previous loop, we use the same time window
+% and slide as those used in the computation of correlations to potentially
+% compare correlations and rates under the same conditions.
+
+% Time window of PSTH
+winsize_PSTH = 1; % ms.
+sliding_window1 = 1; % ms.
+Number_of_points_PSTH = (TrialTime/winsize_PSTH-1)*(winsize_PSTH/sliding_window1); % Number of
+% points in the time axis for which correlations are calculated.
+
+block_slide_size = Total_number_trials / 2 - 1; % = how many trials in one block.
+NBlockTrials = length(LCspike_Trials)-block_slide_size;
+
+% Preallocate arrays
+PSTH_E_control = zeros(NBlockTrials,Number_of_points_PSTH);
+PSTH_E_evoked = zeros(NBlockTrials,Number_of_points_PSTH);
+PSTH_I_control = zeros(NBlockTrials,Number_of_points_PSTH);
+PSTH_I_evoked = zeros(NBlockTrials,Number_of_points_PSTH);
+
+for BlockTrial=1:NBlockTrials
+    tic
+    ControlTrialsUsed = LCzero_Trials(BlockTrial:block_slide_size+BlockTrial-1);
+    LaserTrialsUsed = LCspike_Trials(BlockTrial:block_slide_size+BlockTrial-1);
+    for i = 1:Total_number_trials
+        if(ismember(i,ControlTrialsUsed)) % Count spikes only if i is a control trial.
+            for window = 1:Number_of_points_PSTH
+                T1=TrialTime*(i-1) + sliding_window1*(window-1); % Start of time count
+                T2=T1+winsize_PSTH;   % End of time count
+                
+                PSTH_E_control(BlockTrial,window) = PSTH_E_control(BlockTrial,window) +...
+                    histcounts(spikeTimes_E(spikeTimes_E>T1 & spikeTimes_E< T2)...
+                    ,T1:winsize_PSTH:T2)/(winsize_PSTH*Ne);
+                PSTH_I_control(BlockTrial,window) = PSTH_I_control(BlockTrial,window) +...
+                    histcounts(spikeTimes_I(spikeTimes_I>T1 & spikeTimes_I< T2)...
+                    ,T1:winsize_PSTH:T2)/(winsize_PSTH*Ni);
+            end
+        elseif(ismember(i,LaserTrialsUsed))  % if laser trial.
+            for window = 1:Number_of_points_PSTH
+                T1=TrialTime*(i-1) + sliding_window1*(window-1); % Burn-in period of 200 ms
+                T2=T1+winsize_PSTH;   % Compute covariances until end of simulation
+                
+                PSTH_E_evoked(BlockTrial,window) = PSTH_E_evoked(BlockTrial,window) +...
+                    histcounts(spikeTimes_E(spikeTimes_E>T1 & spikeTimes_E< T2)...
+                    ,T1:winsize_PSTH:T2)/(winsize_PSTH*Ne);
+                PSTH_I_evoked(BlockTrial,window) = PSTH_I_evoked(BlockTrial,window) +...
+                    histcounts(spikeTimes_I(spikeTimes_I>T1 & spikeTimes_I< T2)...
+                    ,T1:winsize_PSTH:T2)/(winsize_PSTH*Ni);
+            end
+        end
+    end
+    toc
+end
+% We summed spike counts over trials, now we divide by over how many trials
+% we added them.
+PSTH_E_control = PSTH_E_control / block_slide_size; 
+PSTH_E_evoked = PSTH_E_evoked / block_slide_size;
+PSTH_I_control = PSTH_I_control / block_slide_size; 
+PSTH_I_evoked = PSTH_I_evoked / block_slide_size;
+
+
+%% Correlations for LC_spike trials.
+%%% All the code below computes spike count covariances, variances, and
+%%% correlations
+
+% Compute spike count covariances over windows of size
+% winsize starting at time T1 and ending at time T2.
+
+% See winsize and sliding_window above when computing rates. We use the
+% same ones here!
+
+Number_of_points_corr = (TrialTime/winsize)*(winsize/sliding_window); % Number of
+% points in the time axis for which correlations are calculated.
+
+block_slide_size = Total_number_trials / 2 - 1; % = how many trials in one block.
+NBlockTrials = length(LCspike_Trials)-block_slide_size;
+
+mRee_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mRei_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mRii_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mCee_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mCei_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mCii_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mVe_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mVi_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mFano_e_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+mFano_i_lc_spike = zeros(NBlockTrials, Number_of_points_corr);
+
+[II,JJ]=meshgrid(1:N,1:N);
+
+corr_time = tic;
+
+% Note this is an input to the function that computes spike count covs.
+Control = 0; % 0 means calculate corrs for evoked trials.
+% 1 means calculate corrs for control trials.
+for BlockTrial=1:NBlockTrials
+    parfor window = 1:Number_of_points_corr
+        T1=sliding_window*(window-1); 
+        T2=T1+winsize;
+        tic
+        C=Noise_SpikeCountCov(s,N,T1,T2,winsize,1:N,BlockTrial,...
+            TrialTime,T,Control,LCzero_Trials,LCspike_Trials,block_slide_size);
+        Fano=FanoFactorOfSpikeCounts(s,N,T1,T2,winsize,1:N,BlockTrial,...
+            TrialTime,T,Control,LCzero_Trials,LCspike_Trials,block_slide_size);
+        toc
+        
+        % Compute mean Fano factor over subpopulations.
+        mFano_e_lc_spike(BlockTrial,window)=nanmean(Fano(1:Ne));
+        mFano_i_lc_spike(BlockTrial,window)=nanmean(Fano(Ne+1:N));
+        
+%       Calculate covariances and variances separately to determine which causes
+% the drop in correlations.
+        mCee_lc_spike(BlockTrial,window)=nanmean(C(II<=Ne & JJ<=II & isfinite(C)));
+        mCei_lc_spike(BlockTrial,window)=nanmean(C(II<=Ne & JJ>Ne & isfinite(C)));
+        mCii_lc_spike(BlockTrial,window)=nanmean(C(II>Ne & JJ>II & isfinite(C)));
+
+        % Compute mean variance over subpopulations.
+        Variance = diag(C);
+        mVe_lc_spike(BlockTrial,window)=nanmean(Variance(1:Ne));
+        mVi_lc_spike(BlockTrial,window)=nanmean(Variance(Ne+1:N));
+       
+        % Get correlation matrix from cov matrix
+        tic
+        R=corrcov(C);
+        toc
+        mRee_lc_spike(BlockTrial,window)=nanmean(R(II<=Ne & JJ<=II & isfinite(R)));
+        mRei_lc_spike(BlockTrial,window)=nanmean(R(II<=Ne & JJ>Ne & isfinite(R)));
+        mRii_lc_spike(BlockTrial,window)=nanmean(R(II>Ne & JJ>II & isfinite(R)));
+    end
+end
+
+
+disp('\n Computation of LC spike correlations finished.')
+toc(corr_time)/60
+
+%% Correlations for LC_nospike trials. 
+%%% All the code below computes spike count covariances and correlations
+
+% Compute spike count covariances over windows of size
+% winsize starting at time T1 and ending at time T2.
+
+mRee_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mRei_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mRii_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mCee_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mCei_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mCii_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mVe_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mVi_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mFano_e_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+mFano_i_lc_nospike = zeros(NBlockTrials, Number_of_points_corr);
+
+% Note this is an input to the function that computes spike count covs.
+Control = 1; % 0 means calculate corrs for LCspike trials.
+% 1 means calculate corrs for control (LCzero) trials.
+
+corr_time = tic;
+
+for BlockTrial=1:NBlockTrials
+    parfor window = 1:Number_of_points_corr
+        T1=sliding_window*(window-1);
+        T2=T1+winsize;  
+        tic
+        C=Noise_SpikeCountCov(s,N,T1,T2,winsize,1:N,BlockTrial,...
+            TrialTime,T,Control,LCzero_Trials,LCspike_Trials,block_slide_size);
+        Fano=FanoFactorOfSpikeCounts(s,N,T1,T2,winsize,1:N,BlockTrial,...
+            TrialTime,T,Control,LCzero_Trials,LCspike_Trials,block_slide_size);
+        toc
+        
+        % Compute mean Fano factor over subpopulations.
+        mFano_e_lc_nospike(BlockTrial,window)=nanmean(Fano(1:Ne));
+        mFano_i_lc_nospike(BlockTrial,window)=nanmean(Fano(Ne+1:N));
+        
+%       Calculate covariances and variances separately to determine which causes
+% the drop in correlations.
+        mCee_lc_nospike(BlockTrial,window)=nanmean(C(II<=Ne & JJ<=II & isfinite(C)));
+        mCei_lc_nospike(BlockTrial,window)=nanmean(C(II<=Ne & JJ>Ne & isfinite(C)));
+        mCii_lc_nospike(BlockTrial,window)=nanmean(C(II>Ne & JJ>II & isfinite(C)));
+
+        % Compute mean variance over subpopulations.
+        Variance = diag(C);
+        mVe_lc_nospike(BlockTrial,window)=nanmean(Variance(1:Ne));
+        mVi_lc_nospike(BlockTrial,window)=nanmean(Variance(Ne+1:N));
+       
+        % Get correlation matrix from cov matrix
+        tic
+        R=corrcov(C);
+        toc
+        mRee_lc_nospike(BlockTrial,window)=nanmean(R(II<=Ne & JJ<=II & isfinite(R)));
+        mRei_lc_nospike(BlockTrial,window)=nanmean(R(II<=Ne & JJ>Ne & isfinite(R)));
+        mRii_lc_nospike(BlockTrial,window)=nanmean(R(II>Ne & JJ>II & isfinite(R)));
+    end
+end
+
+disp('\n Computation of control correlations finished.')
+toc(corr_time)/60
+
+
+%% Plotting results
+%%% I included here a few quick plots to see the results of the experiment.
+%%% Note that if we run the code in compute servers we typically will have
+%%% to comment out the plots and save the variables that we want to plot
+%%% instead.
+
+%% Plot spike count correlations
+%%% Here we plot mean correlations versus the time in the trial.
+averg_corr_lcs = (mRee_lc_spike+2*mRei_lc_spike+mRii_lc_spike)/4;
+averg_corr_lcnos = (mRee_lc_nospike+2*mRei_lc_nospike+mRii_lc_nospike)/4;
+time_axis_corrs = linspace(0,TrialTime,Number_of_points_corr);
+
+figure; hold on; 
+plot(time_axis_corrs, averg_corr_lcs, 'linewidth',3); 
+plot(time_axis_corrs, averg_corr_lcnos, 'linewidth',3)
+legend('LC_spike','LC_nospike')
+xlabel('Time bins')
+ylabel('Mean correlations')
+title('Mean over all pairs')
+
+figure; hold on; 
+plot(time_axis_corrs, mRee_lc_spike,'linewidth',3); 
+plot(time_axis_corrs, mRee_lc_nospike,'linewidth',3)
+legend('LC_spike','LC_nospike')
+xlabel('Time bins')
+ylabel('Mean correlations')
+title('Mean over EE pairs only')
+
+
+% Also plot corr as a single value for control and LCspike trials.
+mRee_lc_spike_mean = mean(mRee_lc_spike);
+mRee_lc_nospike_mean = mean(mRee_lc_nospike);
+
+names = {'LCnospike'; 'LCspike'};
+
+figure; set(gca,'FontSize',18); hold on;
+plot([1,2], [mRee_lc_nospike_mean,mRee_lc_spike_mean],'linewidth',3); 
+set(gca,'xtick',[1:2],'xticklabel',names)
+ylabel('Mean correlations')
+title('Mean over EE pairs only')
+
+
+%% Plot spike count cov, corrs, and variances. Which one changes due to NE release?
+averg_cov_lcs = (mCee_lc_spike+2*mCei_lc_spike+mRii_lc_spike)/4;
+averg_cov_lcnos = (mCee_lc_nospike+2*mCei_lc_nospike+mCii_lc_nospike)/4;
+averg_var_lcs = 0.8*mVe_lc_spike+0.2*mRii_lc_spike;
+averg_var_lcnos = 0.8*mVe_lc_nospike+0.2*mVi_lc_nospike;
+
+figure; hold on; 
+plot(time_axis_corrs, averg_corr_lcs, 'linewidth',3); 
+plot(time_axis_corrs, averg_corr_lcnos, 'linewidth',3)
+plot(time_axis_corrs, averg_cov_lcs, 'linewidth',3); 
+plot(time_axis_corrs, averg_cov_lcnos, 'linewidth',3)
+plot(time_axis_corrs, averg_var_lcs, 'linewidth',3); 
+plot(time_axis_corrs, averg_var_lcnos, 'linewidth',3)
+legend('Corr - evoked','Corr - control','Cov - evoked',...
+    'Cov - control','Var - evoked','Var - control')
+xlabel('Time bins')
+ylabel('Mean correlations')
+title('Mean over all pairs')
+
+figure; hold on; 
+plot(time_axis_corrs, mRee_lc_spike, 'linewidth',3); 
+plot(time_axis_corrs, mRee_lc_nospike, 'linewidth',3)
+plot(time_axis_corrs, mCee_lc_spike, 'linewidth',3); 
+plot(time_axis_corrs, mCee_lc_nospike, 'linewidth',3)
+plot(time_axis_corrs, mVe_lc_spike, 'linewidth',3); 
+plot(time_axis_corrs, mVe_lc_nospike, 'linewidth',3)
+legend('Corr - evoked','Corr - control','Cov - evoked',...
+    'Cov - control','Var - evoked','Var - control')
+xlabel('Time bins')
+ylabel('Mean correlations')
+title('Mean over EE pairs only')
+
+
+% Also plot corr,cov,var as a single value for control and LCspike trials.
+mRee_lc_spike_mean = mean(mRee_lc_spike);
+mRee_lc_nospike_mean = mean(mRee_lc_nospike);
+mCee_lc_spike_mean = mean(mCee_lc_spike);
+mCee_lc_nospike_mean = mean(mCee_lc_nospike);
+mVee_lc_spike_mean = mean(mVe_lc_spike);
+mVee_lc_nospike_mean = mean(mVe_lc_nospike);
+
+figure; set(gca,'FontSize',18); hold on;
+plot([1,2], [mRee_lc_nospike_mean,mRee_lc_spike_mean],'linewidth',3); 
+plot([1,2], [mCee_lc_nospike_mean,mCee_lc_spike_mean],'linewidth',3); 
+plot([1,2], [mVee_lc_nospike_mean,mVee_lc_spike_mean],'linewidth',3); 
+set(gca,'xtick',[1:2],'xticklabel',names)
+legend('Corr','Cov','Var')
+ylabel('Mean corr,cov,var')
+title('Mean over EE pairs only')
+
+
+
+%% Plot Fano factor.
+averg_fano_lcs = 0.8*mFano_e_lc_spike+0.2*mFano_i_lc_spike;
+averg_fano_lcnos = 0.8*mFano_e_lc_nospike+0.2*mFano_i_lc_nospike;
+
+figure; hold on; 
+plot(time_axis_corrs, averg_fano_lcs, 'linewidth',3); 
+plot(time_axis_corrs, averg_fano_lcnos, 'linewidth',3)
+legend('Fano - evoked','Fano - control')
+xlabel('Time bins')
+ylabel('Mean Fano')
+title('Mean over all pairs')
+
+figure; hold on; 
+plot(time_axis_corrs, mFano_e_lc_spike, 'linewidth',3); 
+plot(time_axis_corrs, mFano_e_lc_nospike, 'linewidth',3); 
+plot(time_axis_corrs, mFano_i_lc_spike, 'linewidth',3)
+plot(time_axis_corrs, mFano_i_lc_nospike, 'linewidth',3)
+legend('Fano_e - evoked','Fano_e - control','Fano_i - evoked',...
+    'Fano_i - control')
+xlabel('Time bins')
+ylabel('Mean Fano')
+title('Mean over EE pairs only')
+
+% Also plot Fano as a single value for control and LCspike trials.
+mFano_e_lc_spike_mean = mean(mFano_e_lc_spike);
+mFano_e_lc_nospike_mean = mean(mFano_e_lc_nospike);
+
+figure; set(gca,'FontSize',18); hold on;
+plot([1,2], [mFano_e_lc_nospike_mean,mFano_e_lc_spike_mean],'linewidth',3); 
+set(gca,'xtick',[1:2],'xticklabel',names)
+ylabel('Fano')
+title('Mean over EE pairs only')
+
+
+
+%% Plot firing rates
+figure; hold on; plot(1000*reMean,'linewidth',3); plot(1000*riMean,'linewidth',3)
+legend('E','I')
+xlabel('Trials')
+ylabel('Mean firing rates')
+
+figure; hold on; plot(1:dtRate:T,1000*eRateTime,'linewidth',.1); 
+plot(1:dtRate:T,1000*iRateTime,'linewidth',.1)
+legend('E','I')
+xlabel('Time')
+ylabel('Mean firing rates')
+
+
+figure; hold on; plot(1000*PSTH_E_control,'linewidth',3); 
+plot(1000*PSTH_E_evoked,'linewidth',3)
+plot(1000*PSTH_I_control,'linewidth',3); 
+plot(1000*PSTH_I_evoked,'linewidth',3)
+legend('E control','E evoked','I control', 'I evoked')
+xlabel('Time')
+ylabel('Mean firing rates')
+
+
+% Also plot rates as a single value for control and LCspike trials.
+eRate_lc_spike_mean = mean(1000*PSTH_E_evoked);
+eRate_lc_nospike_mean = mean(1000*PSTH_E_control);
+
+figure; set(gca,'FontSize',18); hold on;
+plot([1,2], [eRate_lc_nospike_mean,eRate_lc_spike_mean],'linewidth',3); 
+set(gca,'xtick',[1:2],'xticklabel',names)
+ylabel('Mean rate (Hz)')
+title('Mean over EE pairs only')
+
+
+% Display the time it took for the simulation and the computation of rates
+% and correlations.
+toc(start_time)/60
+
+
+%% Note when the sims have finished in the log file.
+fprintf('Simulation has finished.\n')
+
+% end
